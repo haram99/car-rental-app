@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 DB_PATH = Path(__file__).parent / "rental.db"
 CAR_FREE, CAR_RENTED = "متاحة", "مؤجرة"
 CAR_STATUSES = [CAR_FREE, CAR_RENTED, "في الصيانة"]
 C_ACTIVE, C_ENDED = "ساري", "منتهي"
+PHOTO_TYPES = ["png", "jpg", "jpeg", "webp"]
 
 st.set_page_config(page_title="نظام تأجير السيارات", page_icon="🚗", layout="wide")
 st.markdown(
@@ -46,6 +48,9 @@ CREATE TABLE IF NOT EXISTS payments(
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.executescript(SCHEMA)
+    if "photo" not in [r[1] for r in conn.execute("PRAGMA table_info(cars)")]:
+        conn.execute("ALTER TABLE cars ADD COLUMN photo BLOB")
+        conn.commit()
     return conn
 
 
@@ -57,6 +62,19 @@ def run(sql: str, params: tuple = ()) -> None:
     conn = get_conn()
     conn.execute(sql, params)
     conn.commit()
+
+
+def process_photo(file) -> bytes:
+    """Resize to max 900px and re-encode as JPEG so the database stays small."""
+    img = Image.open(file).convert("RGB")
+    img.thumbnail((900, 900))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+def is_photo(x) -> bool:
+    return isinstance(x, (bytes, bytearray))
 
 
 def add_months(d: date, n: int) -> date:
@@ -121,13 +139,15 @@ def page_cars() -> None:
         d, e = st.columns(2)
         color = d.text_input("اللون")
         notes = e.text_input("ملاحظات")
+        photo = st.file_uploader("صورة السيارة", type=PHOTO_TYPES)
         if st.form_submit_button("إضافة", type="primary"):
             if not plate.strip() or not model.strip():
                 st.error("رقم اللوحة والموديل مطلوبان.")
             else:
                 try:
-                    run("INSERT INTO cars(plate,model,year,color,notes) VALUES(?,?,?,?,?)",
-                        (plate.strip(), model.strip(), int(year), color.strip(), notes.strip()))
+                    blob = process_photo(photo) if photo else None
+                    run("INSERT INTO cars(plate,model,year,color,notes,photo) VALUES(?,?,?,?,?,?)",
+                        (plate.strip(), model.strip(), int(year), color.strip(), notes.strip(), blob))
                     flash(f"تمت إضافة السيارة {plate.strip()}.")
                 except sqlite3.IntegrityError:
                     st.error("رقم اللوحة موجود مسبقًا.")
@@ -138,12 +158,34 @@ def page_cars() -> None:
     if df.empty:
         st.info("لم تُضف أي سيارة بعد.")
         return
+    gallery = q("SELECT plate, model, status, photo FROM cars ORDER BY id DESC")
+    cols = st.columns(3)
+    for i, r in enumerate(gallery.itertuples()):
+        with cols[i % 3]:
+            if is_photo(r.photo):
+                st.image(r.photo, use_container_width=True)
+            else:
+                st.caption("(لا توجد صورة)")
+            st.markdown(f"**{r.plate}** — {r.model} · {r.status}")
     st.dataframe(df.drop(columns="id"), use_container_width=True, hide_index=True)
 
     st.subheader("تعديل أو حذف")
     labels = {int(r.id): f"{r['اللوحة']} — {r['الموديل']}" for _, r in df.iterrows()}
     car_id = st.selectbox("اختر السيارة", list(labels), format_func=labels.get)
     cur = df[df.id == car_id].iloc[0]
+    cur_photo = q("SELECT photo FROM cars WHERE id=?", (int(car_id),)).iloc[0, 0]
+    if is_photo(cur_photo):
+        st.image(cur_photo, width=320)
+    n = st.session_state.get("up_n", 0)
+    new_photo = st.file_uploader("صورة جديدة للسيارة", type=PHOTO_TYPES, key=f"up_{car_id}_{n}")
+    p1, p2 = st.columns(2)
+    if p1.button("حفظ الصورة") and new_photo:
+        run("UPDATE cars SET photo=? WHERE id=?", (process_photo(new_photo), int(car_id)))
+        st.session_state["up_n"] = n + 1
+        flash("تم حفظ الصورة.")
+    if p2.button("حذف الصورة"):
+        run("UPDATE cars SET photo=NULL WHERE id=?", (int(car_id),))
+        flash("تم حذف الصورة.")
     col1, col2, col3 = st.columns([2, 1, 1])
     status = col1.selectbox("الحالة", CAR_STATUSES, index=CAR_STATUSES.index(cur["الحالة"]))
     if col2.button("حفظ الحالة"):
@@ -254,7 +296,9 @@ def page_backup() -> None:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         for name in ("cars", "contracts", "payments"):
-            q(f"SELECT * FROM {name}").to_excel(xw, sheet_name=name, index=False)
+            sql = ("SELECT id, plate, model, year, color, status, notes FROM cars"
+                   if name == "cars" else f"SELECT * FROM {name}")
+            q(sql).to_excel(xw, sheet_name=name, index=False)
     st.download_button("تنزيل Excel", buf.getvalue(), "rental_export.xlsx")
     st.subheader("استعادة نسخة")
     up = st.file_uploader("ارفع ملف .db", type=["db"])
